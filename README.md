@@ -130,9 +130,9 @@ Producer/
 
 ### 1. Clone the repository
 ```bash
-git clone <https://github.com/Joy-M184/real-time-stock-market.git
+git clone <https://github.com/Joy-M184/real-time-stock-market.git>
 git branch -M main
-git push -u origin main>
+git push -u origin main
 cd Producer
 ```
 
