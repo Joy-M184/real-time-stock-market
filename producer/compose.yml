@@ -1,0 +1,215 @@
+volumes:
+  spark-data:
+  kafka_data:
+  ivy_cache:
+  postgres_data:
+  grafana_data:
+
+networks:
+  stock_data:
+
+services:
+  spark-master:
+    image: spark:3.5.1-python3
+    container_name: spark-master
+    command:
+      - "/opt/spark/bin/spark-class"
+      - "org.apache.spark.deploy.master.Master"
+      - "--host"
+      - "spark-master"
+      - "--port"
+      - "7077"
+      - "--webui-port"
+      - "8080"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+    ports:
+      - "8081:8080"
+      - "7077:7077"
+    volumes:
+      - spark-data:/opt/spark-data
+    networks:
+      - stock_data
+
+  spark-worker:
+    image: spark:3.5.1-python3
+    container_name: spark-worker
+    command:
+      - "/opt/spark/bin/spark-class"
+      - "org.apache.spark.deploy.worker.Worker"
+      - "spark://spark-master:7077"
+      - "--webui-port"
+      - "8081"
+    environment:
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_MEMORY=2G
+    depends_on:
+      spark-master:
+        condition: service_started
+    volumes:
+      - spark-data:/opt/spark-data
+    networks:
+      - stock_data
+
+  postgres:
+    image: postgres:16
+    container_name: postgres_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: stock_data
+    ports:
+      - "5434:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - stock_data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d stock_data"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.10
+    container_name: kafka
+    hostname: kafka
+    ports:
+      - "9092:9092"
+      - "9094:9094"
+    environment:
+      KAFKA_KRAFT_MODE: "true"
+      KAFKA_PROCESS_ROLES: "controller,broker"
+      KAFKA_NODE_ID: 1
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@kafka:9093"
+      KAFKA_LISTENERS: "PLAINTEXT_INTERNAL://0.0.0.0:9092,PLAINTEXT_EXTERNAL://0.0.0.0:9094,CONTROLLER://0.0.0.0:9093"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT_INTERNAL://kafka:9092,PLAINTEXT_EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "PLAINTEXT_INTERNAL:PLAINTEXT,PLAINTEXT_EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT_INTERNAL"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      KAFKA_LOG_DIRS: "/var/lib/kafka/data"
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: "jbzXiYiPQ8a2ejaWHK4Q3w"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - stock_data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stream_consumer:v1
+    container_name: consumer
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      - ivy_cache:/opt/spark/work-dir/.ivy2
+      - ./:/opt/spark/work-dir/apps
+    networks:
+      - stock_data
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: kafka-ui
+    ports:
+      - "8085:8080"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_CLUSTERS_0_NAME: stock_data
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
+    networks:
+      - stock_data
+
+  pgadmin:
+    image: dpage/pgadmin4:9
+    container_name: pgadmin
+    restart: always
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stock_data
+
+  producer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: stream_consumer:v1
+    container_name: producer
+    command: sh -c "while true; do python main.py; echo 'Sleeping 5 minutes...'; sleep 300; done"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - stock_data
+
+  spark-job:
+    image: spark:3.5.1-python3
+    container_name: spark-job
+    command: >-
+      sh -c "
+      mkdir -p /tmp/ivy2/cache &&
+      while true; do
+      /opt/spark/bin/spark-submit
+      --master spark://spark-master:7077
+      --packages org.postgresql:postgresql:42.6.0
+      --conf spark.jars.ivy=/tmp/ivy2
+      /app/spark_job.py;
+      echo 'Spark job done. Sleeping 5 minutes...';
+      sleep 300;
+      done"
+    depends_on:
+      - postgres
+    env_file:
+      - .env
+    volumes:
+      - ./spark_job.py:/app/spark_job.py
+      - ivy_cache:/home/spark/.ivy2
+    networks:
+      - stock_data 
+
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - stock_data
